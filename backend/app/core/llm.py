@@ -42,6 +42,10 @@ class OllamaStatus:
 @lru_cache(maxsize=1)
 def get_chat_model() -> ChatOllama:
     settings = get_settings()
+    print(
+        f"[llm] creating ChatOllama client: model={settings.chat_model!r} "
+        f"base_url={settings.ollama_base_url!r} timeout={settings.llm_request_timeout_s}s"
+    )
     return ChatOllama(
         model=settings.chat_model,
         base_url=settings.ollama_base_url,
@@ -49,6 +53,30 @@ def get_chat_model() -> ChatOllama:
         num_ctx=settings.llm_num_ctx,
         client_kwargs={"timeout": settings.llm_request_timeout_s},
     )
+
+
+def describe_ollama_error(exc: Exception, settings: Settings) -> str:
+    """Turn an httpx/langchain exception into an actionable message.
+
+    ``ChatOllama``/``OllamaEmbeddings`` wrap httpx under the hood, so the
+    exception types below are what actually surfaces when Ollama is down,
+    unreachable, or too slow -- as opposed to a generic ``Exception`` that
+    tells you nothing.
+    """
+    base_url = settings.ollama_base_url
+    if isinstance(exc, httpx.ConnectError):
+        return (
+            f"Cannot reach Ollama at {base_url}. Is `ollama serve` running? "
+            f"({type(exc).__name__}: {exc})"
+        )
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            f"Ollama at {base_url} did not respond within "
+            f"{settings.llm_request_timeout_s}s (model={settings.chat_model!r}). "
+            f"The model may still be loading into memory on a cold start, or the "
+            f"machine is too slow for this model. ({type(exc).__name__}: {exc})"
+        )
+    return f"{type(exc).__name__}: {exc}"
 
 
 @lru_cache(maxsize=1)
@@ -112,7 +140,9 @@ def complete(system: str, user: str) -> str:
     try:
         response = get_chat_model().invoke(build_messages(system, user))
     except Exception as exc:  # noqa: BLE001 - surface a typed error upward
-        raise LLMUnavailableError(str(exc)) from exc
+        detail = describe_ollama_error(exc, get_settings())
+        print(f"[llm] complete() failed: {detail}")
+        raise LLMUnavailableError(detail) from exc
     return message_text(response).strip()
 
 
@@ -120,7 +150,9 @@ async def acomplete(system: str, user: str) -> str:
     try:
         response = await get_chat_model().ainvoke(build_messages(system, user))
     except Exception as exc:  # noqa: BLE001
-        raise LLMUnavailableError(str(exc)) from exc
+        detail = describe_ollama_error(exc, get_settings())
+        print(f"[llm] acomplete() failed: {detail}")
+        raise LLMUnavailableError(detail) from exc
     return message_text(response).strip()
 
 

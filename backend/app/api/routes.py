@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Any
@@ -272,6 +273,15 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+# How often to emit an SSE comment while waiting on the next Ollama token.
+# A CPU-bound 8B model can go quiet for a while between tokens; without a
+# heartbeat, some proxies/antivirus/VPN stacks treat that gap as a dead
+# connection and reset it, which surfaces in the browser as a bare
+# "network error" thrown out of the fetch body reader -- not as our own
+# SSE "error" event, since from the server's point of view nothing failed.
+_CHAT_HEARTBEAT_SECONDS = 12.0
+
+
 @router.post("/chat")
 async def chat(request: ChatRequest, container: ContainerDep) -> Any:
     """Grounded answer over the indexed folder.
@@ -282,13 +292,22 @@ async def chat(request: ChatRequest, container: ContainerDep) -> Any:
     root = _root_or_400(request.path, container)
     _require_index(root, container)
 
+    print(f"[chat] request root={root} question={request.question!r}")
+
     try:
         result = await container.rag.search(root, request.question, request.top_k)
     except LLMUnavailableError as exc:
+        print(f"[chat] retrieval failed, Ollama unavailable: {exc}")
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - never let retrieval crash the request
         logger.exception("search failed for %s", root)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"Search failed: {exc}") from exc
+
+    print(
+        f"[chat] retrieval ok in {result.took_ms:.0f}ms, {len(result.chunks)} chunks -> "
+        f"generating with model={container.settings.chat_model!r} "
+        f"base_url={container.settings.ollama_base_url!r}"
+    )
 
     if not request.stream:
         chunks = [token async for token in container.rag.answer_stream(request.question, result)]
@@ -301,15 +320,62 @@ async def chat(request: ChatRequest, container: ContainerDep) -> Any:
     async def event_stream() -> AsyncIterator[str]:
         yield _sse("plan", result.plan.to_dict())
         yield _sse("sources", {"sources": result.sources_payload()})
+
+        # Run generation in a background task and hand tokens back through a
+        # queue, so this loop is free to emit a heartbeat comment whenever
+        # the queue goes quiet for too long instead of blocking on the model.
+        queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+
+        async def produce() -> None:
+            token_count = 0
+            gen_started = time.perf_counter()
+            try:
+                async for token in container.rag.answer_stream(request.question, result):
+                    token_count += 1
+                    await queue.put(("token", token))
+            except asyncio.CancelledError:
+                print("[chat] generation cancelled (client disconnected)")
+                raise
+            except Exception as exc:  # noqa: BLE001 - must not break the SSE frame
+                # This is the block to watch in your terminal: it fires for a
+                # dead Ollama connection, a missing model, a request timeout,
+                # or any other failure *inside* generation.
+                logger.exception(
+                    "chat generation failed root=%s model=%s base_url=%s after %d token(s)",
+                    root,
+                    container.settings.chat_model,
+                    container.settings.ollama_base_url,
+                    token_count,
+                )
+                print(f"[chat] GENERATION ERROR: {type(exc).__name__}: {exc}")
+                await queue.put(("error", f"{type(exc).__name__}: {exc}"))
+            else:
+                elapsed = time.perf_counter() - gen_started
+                print(f"[chat] generation ok: {token_count} tokens in {elapsed:.1f}s")
+            finally:
+                await queue.put(None)
+
+        producer = asyncio.create_task(produce())
         try:
-            async for token in container.rag.answer_stream(request.question, result):
-                yield _sse("token", {"t": token})
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_CHAT_HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    # Comment lines (leading ':') are valid, inert SSE frames.
+                    # They reset any idle-connection timer downstream without
+                    # the frontend having to parse them as real events.
+                    yield ": keep-alive\n\n"
+                    continue
+                if item is None:
+                    break
+                kind, payload = item
+                if kind == "token":
+                    yield _sse("token", {"t": payload})
+                else:
+                    yield _sse("error", {"detail": payload})
         except asyncio.CancelledError:
-            # Client navigated away; stop cleanly without logging a failure.
+            producer.cancel()
             raise
-        except Exception as exc:  # noqa: BLE001 - must not break the SSE frame
-            logger.exception("chat stream failed")
-            yield _sse("error", {"detail": f"{type(exc).__name__}: {exc}"})
         yield _sse("done", {"tookMs": round(result.took_ms, 1)})
 
     return StreamingResponse(

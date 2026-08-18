@@ -33,6 +33,7 @@ from app.core.llm import (
     LLMUnavailableError,
     acomplete,
     build_messages,
+    describe_ollama_error,
     embed_query,
     get_chat_model,
 )
@@ -97,6 +98,12 @@ _RECENCY_PATTERNS: list[tuple[re.Pattern[str], int]] = [
 
 _FOLDER_HINT_RE = re.compile(r"\b(folder|directory|where.*(stored|kept|live))\b", re.I)
 _QUOTED_RE = re.compile(r"[\"'\u201c]([^\"'\u201d]{2,60})[\"'\u201d]")
+# Unquoted fallback for "file named X.ext" / "file called X.ext" -- users
+# often skip quotes entirely, and a filename almost always ends in an
+# extension, which anchors the match reliably.
+_NAMED_FILE_RE = re.compile(
+    r"\b(?:named|called|titled)\s+([\w][\w .,()\-]{0,80}\.[A-Za-z0-9]{1,6})", re.I
+)
 
 
 @dataclass(slots=True)
@@ -228,11 +235,19 @@ class QueryPlanner:
             days_back = int(match.group(1)) if window == -1 else window
             break
 
+        name_contains = ""
         quoted = _QUOTED_RE.search(question)
+        if quoted:
+            name_contains = quoted.group(1)
+        else:
+            named = _NAMED_FILE_RE.search(question)
+            if named:
+                name_contains = named.group(1).strip().rstrip("?.!,;:")
+
         return SearchPlan(
             semantic_query=question.strip(),
             extensions=extensions,
-            name_contains=quoted.group(1) if quoted else "",
+            name_contains=name_contains,
             days_back=days_back,
             target="folders" if _FOLDER_HINT_RE.search(question) else "files",
         )
@@ -268,6 +283,19 @@ class RagService:
             chunks = await asyncio.to_thread(
                 self._repository.query, root, embedding, settings.retrieval_fetch_k
             )
+
+        # Hybrid retrieval: a literal filename fragment is exact-match
+        # evidence that dense vector search can miss entirely -- especially
+        # for tiny/empty files whose embedding carries almost no content
+        # signal. Keyword hits are merged into the candidate set *before*
+        # ranking so they compete on their own lexical score instead of only
+        # boosting a chunk that the ANN search happened to find anyway.
+        if plan.name_contains:
+            keyword_hits = await asyncio.to_thread(
+                self._repository.find_by_name, root, plan.name_contains
+            )
+            seen_ids = {chunk.id for chunk in chunks}
+            chunks.extend(hit for hit in keyword_hits if hit.id not in seen_ids)
 
         chunks = self._post_rank(chunks, plan)
         return SearchResult(
@@ -327,9 +355,18 @@ class RagService:
                 if isinstance(modified, int | float)
                 else "unknown"
             )
+            rel_path = chunk.rel_path or "(root)"
+            # Filename and path are on their own labelled line, not just
+            # implied by rel_path, so the model cannot fail to notice a file
+            # exists even when its content is empty or irrelevant to the
+            # question.
+            name = chunk.metadata.get("name") or Path(rel_path).name
             blocks.append(
-                f"[{position}] {label}: {chunk.rel_path or '(root)'} "
-                f"(modified {when}, relevance {chunk.score:.2f})\n{chunk.document}"
+                f"[{position}] {label}\n"
+                f"Filename: {name}\n"
+                f"Filepath: {rel_path}\n"
+                f"Modified: {when} | Relevance: {chunk.score:.2f}\n\n"
+                f"{chunk.document}"
             )
 
         return (
@@ -347,7 +384,21 @@ class RagService:
         user sees progress instead of a spinner.
         """
         messages = build_messages(_ANSWER_SYSTEM, self.build_prompt(question, result))
-        async for chunk in get_chat_model().astream(messages):
-            text = message_text(chunk)
-            if text:
-                yield text
+        started = time.perf_counter()
+        first_token_at: float | None = None
+        try:
+            async for chunk in get_chat_model().astream(messages):
+                text = message_text(chunk)
+                if text:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                        logger.info(
+                            "first token in %.2fs (model=%s)",
+                            first_token_at - started,
+                            self._settings.chat_model,
+                        )
+                    yield text
+        except Exception as exc:  # noqa: BLE001 - reraise with an actionable message
+            detail = describe_ollama_error(exc, self._settings)
+            logger.error("answer_stream failed after %.2fs: %s", time.perf_counter() - started, detail)
+            raise RuntimeError(detail) from exc

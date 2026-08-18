@@ -285,6 +285,18 @@ class IndexingService:
                     )
                     chunk_count += 1
 
+            if chunk_count == 0:
+                # A file with no extractable text, or text too short to clear
+                # the boilerplate filter (an empty marker file, a 4-byte
+                # note), would otherwise get zero vectors and become
+                # permanently unsearchable -- even a query for its exact
+                # filename has nothing to match against. One metadata-only
+                # record keeps every scanned file discoverable.
+                pending.append(
+                    self._build_fallback_record(root, file_record, kind, text)
+                )
+                chunk_count = 1
+
             manifest.files[file_record.rel_path] = FileState(
                 size=file_record.size_bytes,
                 mtime=file_record.modified_at,
@@ -349,6 +361,53 @@ class IndexingService:
             VectorRecord(
                 id=chunk_id,
                 document=truncate(chunk, self._settings.chunk_size * 2),
+                embedding=[],
+                metadata=metadata,
+            ),
+            embed_text,
+        )
+
+    def _build_fallback_record(
+        self, root: Path, file_record: FileRecord, kind: str, text: str
+    ) -> tuple[VectorRecord, str]:
+        """A filename-only record for files with no usable content chunk.
+
+        Same embedding shape as ``_build_record`` (filename, folder, type),
+        but there is no body text to append -- the embedding carries pure
+        metadata signal so a query naming the file directly ("is there a
+        file called X?") can still retrieve it via vector search, and the
+        keyword filename lookup in ``VectorRepository.find_by_name`` has a
+        record to find.
+        """
+        chunk_id = f"{root_id(root)}:{file_record.rel_path}:0"
+        folder = file_record.parent_rel or "/"
+        embed_text = (
+            f"File: {file_record.name}\n"
+            f"Folder: {folder}\n"
+            f"Type: {kind}\n\n"
+            "(This file has little or no extractable text content.)"
+        )
+        metadata = sanitize_metadata(
+            {
+                "kind": KIND_CHUNK,
+                "rel_path": file_record.rel_path,
+                "abs_path": file_record.path,
+                "name": file_record.name,
+                "stem": file_record.stem,
+                "ext": file_record.ext or "none",
+                "parent_rel": file_record.parent_rel,
+                "doc_kind": kind,
+                "size": file_record.size_bytes,
+                "modified_at": file_record.modified_at,
+                "chunk_index": 0,
+                "metadata_only": True,
+            }
+        )
+        document = text.strip() or "(This file is empty or has no extractable text.)"
+        return (
+            VectorRecord(
+                id=chunk_id,
+                document=truncate(document, self._settings.chunk_size * 2),
                 embedding=[],
                 metadata=metadata,
             ),

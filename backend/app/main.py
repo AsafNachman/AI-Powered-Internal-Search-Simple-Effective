@@ -90,6 +90,29 @@ def create_app() -> FastAPI:
             status_code=status.HTTP_400_BAD_REQUEST, content={"detail": str(exc)}
         )
 
+    @app.middleware("http")
+    async def _log_unmatched_probes(request: Request, call_next):
+        """Diagnostic: identify what is probing unknown paths like /json/version.
+
+        Uvicorn's access log only records method/path/status, which isn't
+        enough to tell a stray CDP/devtools probe apart from a real client
+        bug. Logging the culprit's headers on a miss costs nothing on the
+        happy path. Remove once the source is confirmed.
+        """
+        response = await call_next(request)
+        if response.status_code == status.HTTP_404_NOT_FOUND:
+            headers = request.headers
+            logger.warning(
+                "404 probe: %s %s | UA=%r Referer=%r Origin=%r client=%s",
+                request.method,
+                request.url.path,
+                headers.get("user-agent"),
+                headers.get("referer"),
+                headers.get("origin"),
+                request.client,
+            )
+        return response
+
     app.include_router(router)
 
     @app.get("/", include_in_schema=False)

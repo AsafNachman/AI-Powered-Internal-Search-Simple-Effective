@@ -221,8 +221,19 @@ export async function streamChat(
     }
     if (buffer.trim()) dispatch(buffer);
   } catch (error) {
+    // Distinct from the fetch()-level catch above: this fires when the
+    // connection drops *after* a response (and often the "sources" event)
+    // already arrived -- e.g. a proxy or VPN/antivirus resetting a
+    // long-lived streaming socket mid-generation. Chrome/Edge report this as
+    // a bare `TypeError: network error`, which is exactly the unhelpful text
+    // this wraps with context about what was actually happening.
     if ((error as Error)?.name !== "AbortError") {
-      handlers.onError?.((error as Error).message);
+      const message = (error as Error)?.message || "network error";
+      console.error("[chat] stream reader failed mid-response:", error);
+      handlers.onError?.(
+        `Connection dropped while the model was answering: ${message}. ` +
+          "The backend request may still be running -- check its terminal log.",
+      );
     }
   } finally {
     finish();

@@ -268,6 +268,56 @@ class VectorRepository:
             )
         return results
 
+    def find_by_name(self, root: Path, needle: str, limit: int = 20) -> list[RetrievedChunk]:
+        """Literal, case-insensitive keyword lookup on filename / path.
+
+        Dense retrieval can miss an exact filename outright: nothing about
+        the embedding of "quarterly numbers" makes a file named "not a frog
+        lol.txt" a close neighbour, even when the user typed that name
+        verbatim. Chroma has no case-insensitive substring operator for
+        metadata filters, so this scans stored names in Python instead --
+        acceptable because it only runs when the query plan extracted a
+        literal name fragment, and these collections are personal-file-share
+        sized, not web sized.
+        """
+        needle_lower = needle.strip().lower()
+        if not needle_lower:
+            return []
+        collection = self._collection(root)
+        if collection.count() == 0:
+            return []
+
+        try:
+            raw = collection.get(include=["documents", "metadatas"])
+        except Exception:  # noqa: BLE001 - a lookup failure should degrade, not 500
+            logger.warning("filename lookup failed for %s", root, exc_info=True)
+            return []
+
+        ids = raw.get("ids") or []
+        documents = raw.get("documents") or []
+        metadatas = raw.get("metadatas") or []
+
+        matches: list[RetrievedChunk] = []
+        for index, chunk_id in enumerate(ids):
+            metadata = dict(metadatas[index] or {}) if index < len(metadatas) else {}
+            name = str(metadata.get("name", "")).lower()
+            rel_path = str(metadata.get("rel_path", "")).lower()
+            if needle_lower not in name and needle_lower not in rel_path:
+                continue
+            matches.append(
+                RetrievedChunk(
+                    id=str(chunk_id),
+                    document=str(documents[index]) if index < len(documents) else "",
+                    # A literal filename match is exact, lexical evidence --
+                    # rank it above approximate semantic hits by default.
+                    score=1.0,
+                    metadata=metadata,
+                )
+            )
+            if len(matches) >= limit:
+                break
+        return matches
+
     def get_folder_summaries(self, root: Path) -> dict[str, str]:
         """All stored folder summaries as ``{rel_path: summary}``."""
         try:
