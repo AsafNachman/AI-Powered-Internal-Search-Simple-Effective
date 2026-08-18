@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local index state: Chroma database + per-root manifests
+backend/.data/
+backend/.env
+
+# Generated demo content
+sample_data/
+
+# Node / Next
+node_modules/
+.next/
+out/
+frontend/.env.local
+*.tsbuildinfo
+next-env.d.ts
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
